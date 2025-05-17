@@ -1,98 +1,94 @@
-import os
-import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from deepgram import Deepgram
-import ffmpeg
+import os
+import logging
+from werkzeug.utils import secure_filename
+import asyncio
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enable CORS to allow requests from the frontend
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Get Deepgram API key from environment variable
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-if not DEEPGRAM_API_KEY:
-    logger.error("Deepgram API key not found in environment variables")
-
+# Deepgram API key
+DEEPGRAM_API_KEY = '32683910a62128aacbef2a8e7710d94c77a46101'  # Replace with your actual Deepgram API key
 deepgram = Deepgram(DEEPGRAM_API_KEY)
 
-@app.route('/')
-def home():
-    logger.info("Root endpoint accessed")
-    return jsonify({"message": "Welcome to the OCR Backend! Use /transcribe to transcribe audio."})
+# Supported file extensions
+ALLOWED_EXTENSIONS = {'.mp3', '.wav', '.mp4'}
+
+# Check if file extension is allowed
+def allowed_file(filename):
+    return os.path.splitext(filename)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/transcribe', methods=['POST'])
 async def transcribe():
-    logger.info("Received request at /transcribe endpoint")
+    logger.info('Received /transcribe request')
+    
+    if 'audio' not in request.files:
+        logger.error('No audio file uploaded')
+        return jsonify({'error': 'No audio file uploaded'}), 400
+
+    file = request.files['audio']
+    filename = secure_filename(file.filename)
+    
+    if not allowed_file(filename):
+        logger.error(f'Unsupported file type: {filename}')
+        return jsonify({'error': 'Unsupported file type. Please upload an MP3, WAV, or MP4 file.'}), 400
+
+    logger.info(f'Uploaded file: {filename}, size: {file.stream.seek(0, os.SEEK_END)} bytes')
+    file.stream.seek(0)  # Reset file pointer to start
+
+    # Determine MIME type
+    extension = os.path.splitext(filename)[1].lower()
+    mime_types = {
+        '.mp3': 'audio/mp3',
+        '.wav': 'audio/wav',
+        '.mp4': 'video/mp4'
+    }
+    mimetype = mime_types.get(extension)
+    logger.info(f'Detected MIME type: {mimetype}')
+
     try:
-        # Check if audio file is in the request
-        if 'audio' not in request.files:
-            logger.error("No audio file provided in request")
-            return jsonify({"error": "No audio file provided"}), 400
-
-        audio_file = request.files['audio']
-        logger.info(f"Received audio file: {audio_file.filename}")
-
-        # Ensure the file is not empty
-        if audio_file.filename == '':
-            logger.error("Empty audio file provided")
-            return jsonify({"error": "Empty audio file provided"}), 400
-
-        # Save the uploaded file temporarily
-        temp_file_path = f"/tmp/{audio_file.filename}"
-        audio_file.save(temp_file_path)
-        logger.info(f"Saved audio file to {temp_file_path}")
-
-        # Convert audio to WAV format if necessary (Deepgram supports WAV)
-        try:
-            output_path = "/tmp/output.wav"
-            ffmpeg.input(temp_file_path).output(output_path, acodec='pcm_s16le', ar='16000', ac=1).run(overwrite_output=True)
-            logger.info(f"Converted audio to WAV: {output_path}")
-        except Exception as e:
-            logger.error(f"Error converting audio with ffmpeg: {str(e)}")
-            return jsonify({"error": f"Error converting audio: {str(e)}"}), 500
-
-        # Read the converted audio file
-        with open(output_path, 'rb') as f:
-            audio_data = f.read()
-        logger.info(f"Read audio data, size: {len(audio_data)} bytes")
-
-        # Prepare Deepgram request
-        source = {'buffer': audio_data, 'mimetype': 'audio/wav'}
-        options = {
-            "punctuate": True,
-            "model": "general",
-            "language": "en",
-            "tier": "enhanced"
+        logger.info('Attempting transcription with Deepgram...')
+        # Read file content into memory
+        source = {
+            'buffer': file.read(),
+            'mimetype': mimetype
         }
 
-        # Transcribe audio using Deepgram
-        logger.info("Sending audio to Deepgram for transcription")
-        response = await deepgram.transcription.sync_prerecorded(source, options)
-        logger.info("Received response from Deepgram")
+        # Transcribe with Deepgram
+        response = await deepgram.transcription.prerecorded(
+            source,
+            {
+                'model': 'nova-2-general',
+                'diarize': True,
+                'smart_format': True,
+                'punctuate': True,
+                'language': 'en'  # Set to 'de' for German audio if needed
+            }
+        )
 
         # Extract transcription
-        transcript = response['results']['channels'][0]['alternatives'][0]['transcript']
-        if not transcript:
-            logger.warning("No transcription available")
-            return jsonify({"text": "No transcription available"})
+        transcription = ''
+        if (response.get('results') and 
+            response['results'].get('channels') and 
+            response['results']['channels'][0].get('alternatives') and 
+            response['results']['channels'][0]['alternatives'][0].get('transcript')):
+            transcription = response['results']['channels'][0]['alternatives'][0]['transcript']
+            logger.info(f'Deepgram transcription successful: {transcription}')
+        else:
+            logger.error('Deepgram transcription returned no result')
+            return jsonify({'error': 'Deepgram transcription returned no result'}), 500
 
-        logger.info(f"Transcription successful: {transcript}")
-        return jsonify({"text": transcript})
+        return jsonify({'text': transcription})
 
     except Exception as e:
-        logger.error(f"Error in transcription: {str(e)}")
-        return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
-
-    finally:
-        # Clean up temporary files
-        for temp_file in [temp_file_path, output_path]:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-                logger.info(f"Cleaned up temporary file: {temp_file}")
+        logger.error(f'Deepgram transcription failed: {str(e)}')
+        return jsonify({'error': f'Deepgram transcription failed: {str(e)}'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
