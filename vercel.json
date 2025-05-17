@@ -2,19 +2,14 @@
     "version": 2,
     "builds": [
       {
-        "src": "api/index.py",
+        "src": "backend.py",
         "use": "@vercel/python"
       }
     ],
     "routes": [
       {
-        "src": "/transcribe",
-        "methods": ["POST"],
-        "dest": "api/index.py"
-      },
-      {
         "src": "/(.*)",
-        "dest": "api/index.py"
+        "dest": "backend.py"
       }
     ]
   }
